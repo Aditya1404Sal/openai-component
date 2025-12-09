@@ -1,53 +1,40 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use futures::{SinkExt, StreamExt};
 use url::Url;
 
 mod bindings {
     wit_bindgen::generate!({
-        world: "ai",
-        generate_all,
-});
+            world: "ai",
+            generate_all,
+    });
 }
 
 use bindings::{
     exports::wasmcloud::ai::streaming_handler::Guest,
     wasi::http::types::{
-        Fields, IncomingRequest, IncomingResponse, Method, OutgoingBody, OutgoingRequest,
-        OutgoingResponse, ResponseOutparam, Scheme,
+        Fields, IncomingResponse, Method, OutgoingBody, OutgoingRequest, OutgoingResponse,
+        ResponseOutparam, Scheme,
     },
 };
 
 struct Component;
 
 impl Guest for Component {
-    fn stream_handle(request: IncomingRequest, response_out: ResponseOutparam) {
+    fn stream_handle(prompt: String, response_out: ResponseOutparam) {
         executor::run(async move {
-            handle_request(request, response_out).await;
+            handle_request(prompt, response_out).await;
         })
     }
 }
 
-async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam) {
-    eprintln!("[COMPONENT] Received request");
-
-    // Extract prompt from request body
-    let prompt = match read_request_body(request).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[COMPONENT] Error reading request body: {e}");
-            server_error(response_out);
-            return;
-        }
-    };
-
+async fn handle_request(prompt: String, response_out: ResponseOutparam) {
     eprintln!("[COMPONENT] Received prompt: {}", prompt);
 
     match openai_proxy(prompt).await {
         Ok(response) => {
             eprintln!("[COMPONENT] Got response from OpenAI API, starting to stream");
-            let mut stream = executor::incoming_body(
-                response.consume().expect("response should be consumable"),
-            );
+            let mut stream =
+                executor::incoming_body(response.consume().expect("response should be consumable"));
 
             let response = OutgoingResponse::new(
                 Fields::from_list(&[
@@ -57,9 +44,8 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
                 .unwrap(),
             );
 
-            let mut body = executor::outgoing_body(
-                response.body().expect("response should be writable"),
-            );
+            let mut body =
+                executor::outgoing_body(response.body().expect("response should be writable"));
 
             ResponseOutparam::set(response_out, Ok(response));
             eprintln!("[COMPONENT] Response headers sent, streaming body chunks");
@@ -69,7 +55,11 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
                 match chunk {
                     Ok(data) => {
                         chunk_count += 1;
-                        eprintln!("[COMPONENT] Streaming chunk {} ({} bytes)", chunk_count, data.len());
+                        eprintln!(
+                            "[COMPONENT] Streaming chunk {} ({} bytes)",
+                            chunk_count,
+                            data.len()
+                        );
                         if let Err(e) = body.send(data).await {
                             eprintln!("[COMPONENT] Error sending body: {e}");
                             break;
@@ -81,7 +71,10 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
                     }
                 }
             }
-            eprintln!("[COMPONENT] Streaming complete, sent {} chunks", chunk_count);
+            eprintln!(
+                "[COMPONENT] Streaming complete, sent {} chunks",
+                chunk_count
+            );
         }
 
         Err(e) => {
@@ -91,37 +84,20 @@ async fn handle_request(request: IncomingRequest, response_out: ResponseOutparam
     }
 }
 
-async fn read_request_body(request: IncomingRequest) -> Result<String> {
-    let mut stream = executor::incoming_body(
-        request.consume().expect("request should be consumable"),
-    );
-
-    let mut prompt_bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        prompt_bytes.extend_from_slice(&chunk?);
-    }
-
-    String::from_utf8(prompt_bytes)
-        .map_err(|e| anyhow!("Invalid UTF-8 in request body: {}", e))
-}
-
 async fn openai_proxy(prompt: String) -> Result<IncomingResponse> {
     let base = "https://api.openai.com/v1/responses";
-    
+
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| anyhow!("OPENAI_API_KEY environment variable not set"))?;
-    
+
     let url: Url = Url::parse(base)?;
 
     // Build outgoing headers
     let headers = Fields::new();
     headers
-        .append(
-            &"content-type".to_string(),
-            &b"application/json".to_vec(),
-        )
+        .append(&"content-type".to_string(), &b"application/json".to_vec())
         .map_err(|_| anyhow!("failed to append content-type header"))?;
-    
+
     headers
         .append(
             &"authorization".to_string(),
@@ -221,16 +197,6 @@ fn respond(status: u16, response_out: ResponseOutparam) {
 }
 
 mod executor {
-    use anyhow::{Error, Result, anyhow};
-    use futures::{Sink, Stream, future, sink, stream};
-    use std::{
-        cell::RefCell,
-        future::Future,
-        mem,
-        rc::Rc,
-        sync::{Arc, Mutex},
-        task::{Context, Poll, Wake, Waker},
-    };
     use crate::bindings::wasi::{
         http::{
             outgoing_handler,
@@ -240,6 +206,16 @@ mod executor {
             },
         },
         io::{self, streams::StreamError},
+    };
+    use anyhow::{anyhow, Error, Result};
+    use futures::{future, sink, stream, Sink, Stream};
+    use std::{
+        cell::RefCell,
+        future::Future,
+        mem,
+        rc::Rc,
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Wake, Waker},
     };
 
     const READ_SIZE: u64 = 16 * 1024;

@@ -8,5 +8,5 @@ world ai {
 interface streaming-handler {
     use wasi:http/types@0.2.2.{incoming-request, response-outparam};
     
-    stream-handle: func(request: incoming-request, response: response-outparam);
+    stream-handle: func(prompt: string, response: response-outparam);
 }
