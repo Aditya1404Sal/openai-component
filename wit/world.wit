@@ -1,7 +1,8 @@
 package wasmcloud:ai;
 
 world ai {
-    import wasi:http/outgoing-handler@0.2.2;
+   import wasi:http/outgoing-handler@0.2.2;
+   import wasi:cli/environment@0.2.2;
    export streaming-handler;
 }
 
