@@ -1,85 +1,78 @@
 use anyhow::{anyhow, bail, Result};
 use futures::{SinkExt, StreamExt};
+use serde_json::Value;
 use url::Url;
 
 mod bindings {
     wit_bindgen::generate!({
-            world: "ai",
-            generate_all,
+        world: "ai",
+        generate_all,
     });
 }
 
 use bindings::{
     exports::wasmcloud::ai::streaming_handler::Guest,
-    wasi::http::types::{
-        Fields, IncomingResponse, Method, OutgoingBody, OutgoingRequest, OutgoingResponse,
-        ResponseOutparam, Scheme,
-    },
+    wasi::http::types::{Fields, IncomingResponse, Method, OutgoingRequest, Scheme},
 };
 
 struct Component;
 
 impl Guest for Component {
-    fn stream_handle(prompt: String, response_out: ResponseOutparam) {
-        executor::run(async move {
-            handle_request(prompt, response_out).await;
-        })
+    fn prompt_handle(prompt: String) -> String {
+        executor::run(async move { handle_request(prompt).await })
     }
 }
 
-async fn handle_request(prompt: String, response_out: ResponseOutparam) {
+bindings::export!(Component with_types_in bindings);
+
+async fn handle_request(prompt: String) -> String {
     eprintln!("[COMPONENT] Received prompt: {}", prompt);
 
     match openai_proxy(prompt).await {
         Ok(response) => {
-            eprintln!("[COMPONENT] Got response from OpenAI API, starting to stream");
+            eprintln!("[COMPONENT] Got response from OpenAI API");
+
             let mut stream =
                 executor::incoming_body(response.consume().expect("response should be consumable"));
+            let mut collected_data = Vec::new();
 
-            let response = OutgoingResponse::new(
-                Fields::from_list(&[
-                    ("content-type".to_string(), b"text/event-stream".to_vec()),
-                    ("cache-control".to_string(), b"no-cache".to_vec()),
-                ])
-                .unwrap(),
-            );
-
-            let mut body =
-                executor::outgoing_body(response.body().expect("response should be writable"));
-
-            ResponseOutparam::set(response_out, Ok(response));
-            eprintln!("[COMPONENT] Response headers sent, streaming body chunks");
-
-            let mut chunk_count = 0;
+            // Collect complete non-streaming response
             while let Some(chunk) = stream.next().await {
                 match chunk {
-                    Ok(data) => {
-                        chunk_count += 1;
-                        eprintln!(
-                            "[COMPONENT] Streaming chunk {} ({} bytes)",
-                            chunk_count,
-                            data.len()
-                        );
-                        if let Err(e) = body.send(data).await {
-                            eprintln!("[COMPONENT] Error sending body: {e}");
-                            break;
-                        }
-                    }
+                    Ok(data) => collected_data.extend_from_slice(&data),
                     Err(e) => {
                         eprintln!("[COMPONENT] Error receiving body: {e}");
-                        break;
+                        return format!("Error collecting response: {}", e);
                     }
                 }
             }
-            eprintln!(
-                "[COMPONENT] Streaming complete, sent {} chunks",
-                chunk_count
-            );
-        }
 
+            eprintln!(
+                "[COMPONENT] Response collected, {} bytes",
+                collected_data.len()
+            );
+
+            // Convert to string
+            let raw_response = match String::from_utf8(collected_data) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("[COMPONENT] UTF-8 error: {e}");
+                    return format!("Error: Invalid UTF-8 response");
+                }
+            };
+
+            // Parse JSON and extract output text for non-streaming response
+            match parse_complete_response(&raw_response) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("[COMPONENT] JSON parse error: {e}");
+                    raw_response // Fallback to raw JSON
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("[COMPONENT] Error sending outgoing request to OpenAI API: {e}");
-            server_error(response_out);
+            eprintln!("[COMPONENT] OpenAI request error: {e}");
+            format!("Error: {}", e)
         }
     }
 }
@@ -92,30 +85,28 @@ async fn openai_proxy(prompt: String) -> Result<IncomingResponse> {
 
     let url: Url = Url::parse(base)?;
 
-    // Build outgoing headers
+    // Build headers
     let headers = Fields::new();
     headers
-        .append(&"content-type".to_string(), &b"application/json".to_vec())
-        .map_err(|_| anyhow!("failed to append content-type header"))?;
-
+        .append(&"content-type".to_string(), b"application/json")
+        .map_err(|_| anyhow!("failed to set content-type"))?;
     headers
         .append(
             &"authorization".to_string(),
-            &format!("Bearer {}", api_key).into_bytes(),
+            format!("Bearer {}", api_key).as_bytes(),
         )
-        .map_err(|_| anyhow!("failed to append authorization header"))?;
+        .map_err(|_| anyhow!("failed to set authorization"))?;
 
     let outgoing_request = OutgoingRequest::new(headers);
 
     outgoing_request
         .set_method(&Method::Post)
-        .map_err(|()| anyhow!("failed to set method"))?;
+        .map_err(|()| anyhow!("failed to set POST method"))?;
 
     let path_with_query = url.path().to_string();
-
     outgoing_request
         .set_path_with_query(Some(&path_with_query))
-        .map_err(|()| anyhow!("failed to set path_with_query"))?;
+        .map_err(|()| anyhow!("failed to set path"))?;
 
     outgoing_request
         .set_scheme(Some(&match url.scheme() {
@@ -137,65 +128,72 @@ async fn openai_proxy(prompt: String) -> Result<IncomingResponse> {
         )))
         .map_err(|()| anyhow!("failed to set authority"))?;
 
-    // Safely escape JSON special characters for embedding in a string literal
-    let escaped_prompt = prompt
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-
-    // Build the OpenAI JSON request body with streaming enabled
+    // JSON payload with stream: false for complete response
     let json_request = format!(
         r#"{{
-  "model": "gpt-4.1",
-  "input": "{}",
-  "stream": true
-}}"#,
-        escaped_prompt
+            "model": "gpt-4.1",
+            "input": "{}",
+            "stream": false
+        }}"#,
+        prompt.replace('\\', "\\\\").replace('"', "\\\"")
     );
 
-    // Get the outgoing body and send the JSON payload
-    let mut body = executor::outgoing_body(
-        outgoing_request
-            .body()
-            .expect("request body should be writable"),
-    );
-
+    // Send request body
+    let mut body = executor::outgoing_body(outgoing_request.body().expect("body writable"));
     body.send(json_request.into_bytes()).await?;
-
-    // Drop body to signal we're done writing
     drop(body);
 
-    // Send the outgoing request and await the response
+    // Send request
     let response = executor::outgoing_request_send(outgoing_request).await?;
 
     let status = response.status();
-
     if !(200..300).contains(&status) {
-        bail!("unexpected status: {status}");
+        bail!("HTTP {} from OpenAI", status);
     }
 
     Ok(response)
 }
 
-fn server_error(response_out: ResponseOutparam) {
-    respond(500, response_out)
+fn parse_complete_response(json_str: &str) -> Result<String> {
+    let json: Value =
+        serde_json::from_str(json_str).map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
+
+    // Primary path: OpenAI Responses API format from your exact log output
+    if let Some(output_array) = json.get("output") {
+        if let Some(first_msg) = output_array.get(0usize) {
+            // Use usize index for array access
+            if let Some(content_array) = first_msg.get("content") {
+                if let Some(content_item) = content_array.get(0usize) {
+                    // Use usize index
+                    // Direct "text" field check first (handles your exact format)
+                    if let Some(text) = content_item.get("text") {
+                        if let Some(text_str) = text.as_str() {
+                            return Ok(text_str.to_string());
+                        }
+                    }
+                    // Fallback to output_text.text
+                    if let Some(output_text) = content_item.get("output_text") {
+                        if let Some(text) = output_text.get("text") {
+                            if let Some(text_str) = text.as_str() {
+                                return Ok(text_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Debug: Log the structure if parsing fails
+    eprintln!(
+        "[COMPONENT] JSON keys: {:?}",
+        json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+
+    bail!("No output text found in response")
 }
 
-fn respond(status: u16, response_out: ResponseOutparam) {
-    let response = OutgoingResponse::new(Fields::new());
-    response
-        .set_status_code(status)
-        .expect("setting status code");
-
-    let body = response.body().expect("response should be writable");
-
-    ResponseOutparam::set(response_out, Ok(response));
-
-    OutgoingBody::finish(body, None).expect("outgoing-body.finish");
-}
-
+// [Keep the entire executor module unchanged - it's the same as original]
 mod executor {
     use crate::bindings::wasi::{
         http::{
@@ -226,7 +224,6 @@ mod executor {
         futures::pin_mut!(future);
 
         struct DummyWaker;
-
         impl Wake for DummyWaker {
             fn wake(self: Arc<Self>) {}
         }
@@ -237,16 +234,13 @@ mod executor {
             match future.as_mut().poll(&mut Context::from_waker(&waker)) {
                 Poll::Pending => {
                     let mut new_wakers = Vec::new();
-
-                    let wakers = mem::take::<Vec<_>>(&mut WAKERS.lock().unwrap());
-
+                    let wakers = mem::take::<Vec<_>>(&mut *WAKERS.lock().unwrap());
                     assert!(!wakers.is_empty());
 
                     let pollables = wakers
                         .iter()
                         .map(|(pollable, _)| pollable)
                         .collect::<Vec<_>>();
-
                     let mut ready = vec![false; wakers.len()];
 
                     for index in io::poll::poll(&pollables) {
@@ -255,7 +249,7 @@ mod executor {
 
                     for (ready, (pollable, waker)) in ready.into_iter().zip(wakers) {
                         if ready {
-                            waker.wake()
+                            waker.wake();
                         } else {
                             new_wakers.push((pollable, waker));
                         }
@@ -283,54 +277,50 @@ mod executor {
         let stream = body.write().expect("response body should be writable");
         let pair = Rc::new(RefCell::new(Outgoing(Some((stream, body)))));
 
-        sink::unfold((), {
-            move |(), chunk: Vec<u8>| {
-                future::poll_fn({
-                    let mut offset = 0;
-                    let mut flushing = false;
-                    let pair = pair.clone();
+        sink::unfold((), move |(), chunk: Vec<u8>| {
+            future::poll_fn({
+                let mut offset = 0;
+                let mut flushing = false;
+                let pair = pair.clone();
 
-                    move |context| {
-                        let pair = pair.borrow();
-                        let (stream, _) = &pair.0.as_ref().unwrap();
+                move |context| {
+                    let pair = pair.borrow();
+                    let (stream, _) = &pair.0.as_ref().unwrap();
 
-                        loop {
-                            match stream.check_write() {
-                                Ok(0) => {
-                                    WAKERS
-                                        .lock()
-                                        .unwrap()
-                                        .push((stream.subscribe(), context.waker().clone()));
-
-                                    break Poll::Pending;
-                                }
-                                Ok(count) => {
-                                    if offset == chunk.len() {
-                                        if flushing {
-                                            break Poll::Ready(Ok(()));
-                                        } else {
-                                            stream.flush().expect("stream should be flushable");
-                                            flushing = true;
-                                        }
+                    loop {
+                        match stream.check_write() {
+                            Ok(0) => {
+                                WAKERS
+                                    .lock()
+                                    .unwrap()
+                                    .push((stream.subscribe(), context.waker().clone()));
+                                break Poll::Pending;
+                            }
+                            Ok(count) => {
+                                if offset == chunk.len() {
+                                    if flushing {
+                                        break Poll::Ready(Ok(()));
                                     } else {
-                                        let count = usize::try_from(count)
-                                            .unwrap()
-                                            .min(chunk.len() - offset);
+                                        stream.flush().expect("stream should be flushable");
+                                        flushing = true;
+                                    }
+                                } else {
+                                    let count =
+                                        usize::try_from(count).unwrap().min(chunk.len() - offset);
 
-                                        match stream.write(&chunk[offset..][..count]) {
-                                            Ok(()) => {
-                                                offset += count;
-                                            }
-                                            Err(_) => break Poll::Ready(Err(anyhow!("I/O error"))),
+                                    match stream.write(&chunk[offset..][..count]) {
+                                        Ok(()) => {
+                                            offset += count;
                                         }
+                                        Err(_) => break Poll::Ready(Err(anyhow!("I/O error"))),
                                     }
                                 }
-                                Err(_) => break Poll::Ready(Err(anyhow!("I/O error"))),
                             }
+                            Err(_) => break Poll::Ready(Err(anyhow!("I/O error"))),
                         }
                     }
-                })
-            }
+                }
+            })
         })
     }
 
@@ -385,77 +375,60 @@ mod executor {
             let stream = body.stream().expect("response body should be readable");
             let mut incoming = Incoming(Inner::Stream { stream, body });
 
-            move |context| {
-                loop {
-                    match &incoming.0 {
-                        Inner::Stream { stream, .. } => match stream.read(READ_SIZE) {
-                            Ok(buffer) => {
-                                return if buffer.is_empty() {
-                                    WAKERS
-                                        .lock()
-                                        .unwrap()
-                                        .push((stream.subscribe(), context.waker().clone()));
-                                    Poll::Pending
-                                } else {
-                                    Poll::Ready(Some(Ok(buffer)))
-                                };
-                            }
-                            Err(StreamError::Closed) => {
-                                let Inner::Stream { stream, body } =
-                                    mem::replace(&mut incoming.0, Inner::Closed)
-                                else {
-                                    unreachable!();
-                                };
-                                drop(stream);
-                                incoming.0 = Inner::Trailers(IncomingBody::finish(body));
-                            }
-                            Err(StreamError::LastOperationFailed(error)) => {
-                                return Poll::Ready(Some(Err(anyhow!(
-                                    "{}",
-                                    error.to_debug_string()
-                                ))));
-                            }
-                        },
+            move |context| loop {
+                match &incoming.0 {
+                    Inner::Stream { stream, .. } => match stream.read(READ_SIZE) {
+                        Ok(buffer) => {
+                            return if buffer.is_empty() {
+                                WAKERS
+                                    .lock()
+                                    .unwrap()
+                                    .push((stream.subscribe(), context.waker().clone()));
+                                Poll::Pending
+                            } else {
+                                Poll::Ready(Some(Ok(buffer)))
+                            };
+                        }
+                        Err(StreamError::Closed) => {
+                            let Inner::Stream { stream, body } =
+                                mem::replace(&mut incoming.0, Inner::Closed)
+                            else {
+                                unreachable!();
+                            };
+                            drop(stream);
+                            incoming.0 = Inner::Trailers(IncomingBody::finish(body));
+                        }
+                        Err(StreamError::LastOperationFailed(error)) => {
+                            return Poll::Ready(Some(Err(anyhow!("{}", error.to_debug_string()))));
+                        }
+                    },
 
-                        Inner::Trailers(trailers) => {
-                            match trailers.get() {
-                                Some(Ok(trailers)) => {
-                                    incoming.0 = Inner::Closed;
-                                    match trailers {
-                                        Ok(Some(_)) => {
-                                            // Currently, we just ignore any trailers.
-                                        }
-                                        Ok(None) => {
-                                            // No trailers; nothing else to do.
-                                        }
-                                        Err(error) => {
-                                            // Error reading the trailers: pass it on to the application.
-                                            return Poll::Ready(Some(Err(anyhow!("{error:?}"))));
-                                        }
-                                    }
-                                }
-                                Some(Err(_)) => {
-                                    // Should only happen if we try to retrieve the trailers twice.
-                                    unreachable!();
-                                }
-                                None => {
-                                    WAKERS
-                                        .lock()
-                                        .unwrap()
-                                        .push((trailers.subscribe(), context.waker().clone()));
-                                    return Poll::Pending;
+                    Inner::Trailers(trailers) => match trailers.get() {
+                        Some(Ok(trailers)) => {
+                            incoming.0 = Inner::Closed;
+                            match trailers {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {}
+                                Err(error) => {
+                                    return Poll::Ready(Some(Err(anyhow!("{error:?}"))));
                                 }
                             }
                         }
-
-                        Inner::Closed => {
-                            return Poll::Ready(None);
+                        Some(Err(_)) => unreachable!(),
+                        None => {
+                            WAKERS
+                                .lock()
+                                .unwrap()
+                                .push((trailers.subscribe(), context.waker().clone()));
+                            return Poll::Pending;
                         }
+                    },
+
+                    Inner::Closed => {
+                        return Poll::Ready(None);
                     }
                 }
             }
         })
     }
 }
-
-bindings::export!(Component with_types_in bindings);

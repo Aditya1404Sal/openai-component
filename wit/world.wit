@@ -6,8 +6,6 @@ world ai {
    export streaming-handler;
 }
 
-interface streaming-handler {
-    use wasi:http/types@0.2.2.{incoming-request, response-outparam};
-    
-    stream-handle: func(prompt: string, response: response-outparam);
+interface streaming-handler {    
+    prompt-handle: func(prompt: string) -> string;
 }
