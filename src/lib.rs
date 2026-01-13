@@ -11,7 +11,7 @@ mod bindings {
 }
 
 use bindings::{
-    exports::wasmcloud::ai::streaming_handler::Guest,
+    exports::wasmcloud::ai::response_handler::Guest,
     wasi::http::types::{Fields, IncomingResponse, Method, OutgoingRequest, Scheme},
 };
 

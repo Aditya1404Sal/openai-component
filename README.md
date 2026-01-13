@@ -46,7 +46,7 @@ Once composed, the final component can be run with wasmtime or deployed to wasmC
 
 ## WIT Interface
 
-The component exports a `prompt-handle` function defined in the `wasmcloud:ai/streaming-handler` interface:
+The component exports a `prompt-handle` function defined in the `wasmcloud:ai/response-handler` interface:
 
 ```wit
 prompt-handle: func(prompt: string) -> string;
